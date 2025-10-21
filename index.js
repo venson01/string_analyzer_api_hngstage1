@@ -1,13 +1,12 @@
 
-//String Analyzer API using Node.js + Express + better-sqlite3 
- 
+//String Analyzer API (Node.js + Express + better-sqlite3) 
 
 const express = require('express');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
 const helmet = require('helmet');
 
-const DB_PATH = './strings.db';
+const DB_PATH = process.env.DB_PATH || './strings.db';
 const PORT = process.env.PORT || 8000;
 const MAX_STRING_LENGTH = 10000; // to restrict huge inputs
 
@@ -15,9 +14,9 @@ const app = express();
 app.use(helmet());
 app.use(express.json({ limit: '1mb' }));
 
-// -----------------------------
-// DB initialization
-// -----------------------------
+/*-----------------------------
+   DB initialization
+  -----------------------------*/
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
@@ -39,10 +38,11 @@ db.prepare('CREATE INDEX IF NOT EXISTS idx_strings_value_lower ON strings(value_
 db.prepare('CREATE INDEX IF NOT EXISTS idx_strings_length ON strings(length)').run();
 db.prepare('CREATE INDEX IF NOT EXISTS idx_strings_word_count ON strings(word_count)').run();
 
-// -----------------------------
-// Utilities
-// -----------------------------
+/* -----------------------------
+    Utilities
+   -----------------------------*/
 function sha256Of(text) {
+  // Ensure SHA-256 is computed from the exact input string using utf8
   return crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 }
 
@@ -55,7 +55,7 @@ function computeCharacterFrequency(s) {
 }
 
 function normalizeForPalindrome(s) {
-  // Case-insensitive. Keep spaces/punct unless you want to strip them.
+  // Case-insensitive palindrome check per requirement: lowercase only
   return s.toLowerCase();
 }
 
@@ -100,15 +100,16 @@ function rowToItem(row) {
   };
 }
 
-// -----------------------------
-// Routes
-// -----------------------------
+/* -----------------------------
+   Routes
+   -----------------------------*/
 
 // Create / Analyze
 app.post('/strings', (req, res) => {
-  const { value } = req.body || {};
-  if (value === undefined) return res.status(400).json({ detail: 'Invalid request body or missing "value" field' });
-  if (typeof value !== 'string') return res.status(422).json({ detail: 'Invalid data type for "value" (must be string)' });
+  const body = req.body;
+  if (!body || body.value === undefined) return res.status(400).json({ detail: 'Invalid request body or missing "value" field' });
+  if (typeof body.value !== 'string') return res.status(422).json({ detail: 'Invalid data type for "value" (must be string)' });
+  const value = body.value;
   if (value.length > MAX_STRING_LENGTH) return res.status(413).json({ detail: 'String too large' });
 
   const properties = computeProperties(value);
@@ -132,19 +133,20 @@ app.post('/strings', (req, res) => {
       JSON.stringify(properties)
     );
   } catch (err) {
-    // Assume uniqueness conflict
+    // Unique constraint violation -> Conflict
     return res.status(409).json({ detail: 'String already exists in the system' });
   }
 
+  // Return 201 Created with the resource
   return res.status(201).json({ id, value, properties, created_at });
 });
 
-// Get by value (exact match) - value must be URL encoded when necessary
+// Get by value (exact match)
 app.get('/strings/:string_value', (req, res) => {
   const v = req.params.string_value;
   const row = db.prepare('SELECT * FROM strings WHERE value = ?').get(v);
   if (!row) return res.status(404).json({ detail: 'String does not exist in the system' });
-  return res.json(rowToItem(row));
+  return res.status(200).json(rowToItem(row));
 });
 
 // Get by id (sha256)
@@ -152,10 +154,10 @@ app.get('/strings/by-id/:id', (req, res) => {
   const id = req.params.id;
   const row = db.prepare('SELECT * FROM strings WHERE id = ?').get(id);
   if (!row) return res.status(404).json({ detail: 'String does not exist in the system' });
-  return res.json(rowToItem(row));
+  return res.status(200).json(rowToItem(row));
 });
 
-// Delete - value must be URL encoded when necessary
+// Delete
 app.delete('/strings/:string_value', (req, res) => {
   const v = req.params.string_value;
   const info = db.prepare('DELETE FROM strings WHERE value = ?').run(v);
@@ -173,7 +175,7 @@ app.get('/strings', (req, res) => {
   if (q.is_palindrome !== undefined) {
     if (q.is_palindrome === 'true') clauses.push('is_palindrome = 1');
     else if (q.is_palindrome === 'false') clauses.push('is_palindrome = 0');
-    else return res.status(400).json({ detail: 'Invalid is_palindrome value' });
+    else return res.status(400).json({ detail: 'Invalid query parameter values or types for is_palindrome' });
     filtersApplied.is_palindrome = q.is_palindrome === 'true';
   }
 
@@ -211,18 +213,22 @@ app.get('/strings', (req, res) => {
 
   const rows = db.prepare(sql).all(...params);
   const items = rows.map(rowToItem);
-  return res.json({ data: items, count: items.length, filters_applied: Object.keys(filtersApplied).length ? filtersApplied : undefined });
+  return res.status(200).json({ data: items, count: items.length, filters_applied: Object.keys(filtersApplied).length ? filtersApplied : undefined });
 });
 
-// Natural language filter - same heuristic parser but reuse SQL-based list when possible
+// Natural language filter - basic keyword detection
 function parseNlQuery(q) {
   const original = q;
   const lower = q.toLowerCase();
   const parsed = {};
 
+  // "single word" or "one word"
   if (/\b(single|one) word\b/.test(lower)) parsed.word_count = 1;
+
+  // palindrome keywords
   if (lower.includes('palindr') || lower.includes('palindrom') || lower.includes('palind')) parsed.is_palindrome = true;
 
+  // "longer than N" -> min_length = N+1 (heuristic to match example)
   let m = lower.match(/longer than (\d+) (characters|chars)?/);
   if (m) parsed.min_length = Number(m[1]) + 1;
   else {
@@ -230,9 +236,11 @@ function parseNlQuery(q) {
     if (m2) parsed.min_length = Number(m2[1]) + 1;
   }
 
+  // "contain the letter z" or "containing z"
   let m3 = lower.match(/(?:contain(?:ing)?(?: the)?(?: letter)? )([a-z])\b/);
   if (m3) parsed.contains_character = m3[1];
 
+  // "first vowel" -> heuristic 'a'
   if (lower.includes('first vowel')) parsed.contains_character = 'a';
 
   if (Object.keys(parsed).length === 0) throw new Error('Unable to parse natural language query');
@@ -251,23 +259,26 @@ app.get('/strings/filter-by-natural-language', (req, res) => {
     return res.status(400).json({ detail: 'Unable to parse natural language query' });
   }
 
-  // Map parsed filters to query params and delegate to /strings logic via internal call
-  const parsed = interp.parsed_filters;
-  const params = [];
-  const clauses = [];
+  const filters = interp.parsed_filters;
+  if ('min_length' in filters && 'max_length' in filters) {
+    if (filters.min_length > filters.max_length) return res.status(422).json({ detail: 'Query parsed but resulted in conflicting filters' });
+  }
 
-  if ('is_palindrome' in parsed) clauses.push('is_palindrome = 1');
-  if ('min_length' in parsed) { clauses.push('length >= ?'); params.push(parsed.min_length); }
-  if ('max_length' in parsed) { clauses.push('length <= ?'); params.push(parsed.max_length); }
-  if ('word_count' in parsed) { clauses.push('word_count = ?'); params.push(parsed.word_count); }
-  if ('contains_character' in parsed) { clauses.push('instr(value_lower, ?) > 0'); params.push(parsed.contains_character.toLowerCase()); }
+  // Build SQL WHERE clause from parsed filters
+  const clauses = [];
+  const params = [];
+  if (filters.is_palindrome) clauses.push('is_palindrome = 1');
+  if ('min_length' in filters) { clauses.push('length >= ?'); params.push(filters.min_length); }
+  if ('max_length' in filters) { clauses.push('length <= ?'); params.push(filters.max_length); }
+  if ('word_count' in filters) { clauses.push('word_count = ?'); params.push(filters.word_count); }
+  if ('contains_character' in filters) { clauses.push('instr(value_lower, ?) > 0'); params.push(filters.contains_character.toLowerCase()); }
 
   const where = clauses.length ? ('WHERE ' + clauses.join(' AND ')) : '';
   const sql = `SELECT * FROM strings ${where} ORDER BY created_at DESC LIMIT 100`;
   const rows = db.prepare(sql).all(...params);
   const items = rows.map(rowToItem);
 
-  return res.json({ data: items, count: items.length, interpreted_query: interp });
+  return res.status(200).json({ data: items, count: items.length, interpreted_query: interp });
 });
 
 // -----------------------------
