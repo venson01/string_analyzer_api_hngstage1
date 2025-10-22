@@ -147,8 +147,8 @@ app.post('/strings', (req, res) => {
     if (msg.includes('unique') || msg.includes('constraint')) {
       return res.status(409).json({ detail: 'String already exists in the system' });
     }
-    console.error('DB insert error', err);
-    return res.status(500).json({ detail: 'Internal Server Error' });
+    /*console.error('DB insert error', err);
+    return res.status(500).json({ detail: 'Internal Server Error' });*/
   }
 
   return res.status(201).json({ id, value, properties, created_at });
@@ -181,8 +181,8 @@ app.delete('/strings/:string_value', (req, res) => {
 // GET /strings (list + filters)
 app.get('/strings', (req, res) => {
   const q = req.query || {};
-  const clauses = [];
-  const params = [];
+  const clauses = {};
+  const params = {};
   const filtersApplied = {};
 
   // is_palindrome
