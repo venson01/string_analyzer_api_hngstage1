@@ -1,6 +1,5 @@
-
 //String Analyzer API (Node.js + Express + better-sqlite3)
- 
+
 const express = require('express');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
@@ -110,10 +109,10 @@ function rowToItem(row) {
 // POST /strings - create/analyze
 app.post('/strings', (req, res) => {
   const body = req.body;
-  if (!body) {
+  if (!body || !Object.prototype.hasOwnProperty.call(body, 'value')) {
     return res.status(400).json({ detail: 'Invalid request body or missing "value" field' });
   }
-  if (typeof body !== 'string') {
+  if (typeof body.value !== 'string') {
     return res.status(422).json({ detail: 'Invalid data type for "value" (must be string)' });
   }
   const value = body.value;
@@ -181,8 +180,8 @@ app.delete('/strings/:string_value', (req, res) => {
 // GET /strings (list + filters)
 app.get('/strings', (req, res) => {
   const q = req.query || {};
-  const clauses = {};
-  const params = {};
+  const clauses = [];
+  const params = [];
   const filtersApplied = {};
 
   // is_palindrome
