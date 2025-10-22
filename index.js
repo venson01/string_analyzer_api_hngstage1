@@ -1,366 +1,335 @@
+
+//String Analyzer API (Node.js + Express + better-sqlite3)
+ 
 const express = require('express');
+const Database = require('better-sqlite3');
 const crypto = require('crypto');
-const { URLSearchParams } = require('url'); // Used for parsing query strings cleanly
+const helmet = require('helmet');
+
+const DB_PATH = process.env.DB_PATH || './strings.db';
+const PORT = process.env.PORT || 8000;
+const MAX_STRING_LENGTH = process.env.MAX_STRING_LENGTH ? parseInt(process.env.MAX_STRING_LENGTH, 10) : 10000;
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(helmet());
+app.use(express.json({ limit: '1mb' }));
 
-// Middleware to parse JSON request bodies
-app.use(express.json());
+// -----------------------------
+// DB init
+// -----------------------------
+const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
 
-// In-memory database, keyed by SHA-256 hash
-// Structure: { hash: { id, value, properties, created_at } }
-const db = new Map();
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS strings (
+    id TEXT PRIMARY KEY,
+    value TEXT UNIQUE NOT NULL,
+    value_lower TEXT NOT NULL,
+    length INTEGER NOT NULL,
+    word_count INTEGER NOT NULL,
+    is_palindrome INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    properties_json TEXT NOT NULL
+  )
+`).run();
 
-// --- Utility Functions for String Analysis ---
+// Indexes to speed up queries
+db.prepare('CREATE INDEX IF NOT EXISTS idx_strings_value_lower ON strings(value_lower)').run();
+db.prepare('CREATE INDEX IF NOT EXISTS idx_strings_length ON strings(length)').run();
+db.prepare('CREATE INDEX IF NOT EXISTS idx_strings_word_count ON strings(word_count)').run();
 
-/**
- * Computes the SHA-256 hash of a string.
- * @param {string} value - The input string.
- * @returns {string} The SHA-256 hash in hexadecimal format.
- */
-function sha256Hash(value) {
-    return crypto.createHash('sha256').update(value).digest('hex');
+// -----------------------------
+// Utilities
+// -----------------------------
+function sha256Of(text) {
+  // compute SHA-256 using exact UTF-8 bytes
+  return crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 }
 
-/**
- * Checks if a string is a palindrome (case-insensitive, exact match).
- * @param {string} value - The input string.
- * @returns {boolean} True if palindrome, false otherwise.
- */
-function isPalindrome(value) {
-    const normalized = value.toLowerCase();
-    const reversed = normalized.split('').reverse().join('');
-    return normalized === reversed;
+function computeCharacterFrequency(s) {
+  const freq = {};
+  for (const ch of s) {
+    freq[ch] = (freq[ch] || 0) + 1;
+  }
+  return freq;
 }
 
-/**
- * Counts the number of distinct characters in a string.
- * @param {string} value - The input string.
- * @returns {number} The count of unique characters.
- */
-function uniqueCharacters(value) {
-    return new Set(value.split('')).size;
+function normalizeForPalindrome(s) {
+  // Case-insensitive per requirement: convert to lowercase only
+  return s.toLowerCase();
 }
 
-/**
- * Counts the number of words separated by whitespace.
- * @param {string} value - The input string.
- * @returns {number} The word count.
- */
-function wordCount(value) {
-    const trimmed = value.trim();
-    if (!trimmed) return 0;
-    // Split by any sequence of whitespace characters (including newlines)
-    return trimmed.split(/\s+/).length;
+function isPalindrome(s) {
+  const n = normalizeForPalindrome(s);
+  return n === n.split('').reverse().join('');
 }
 
-/**
- * Creates a map of character frequencies.
- * @param {string} value - The input string.
- * @returns {Object<string, number>} The frequency map.
- */
-function charFrequencyMap(value) {
-    const freqMap = {};
-    for (const char of value) {
-        freqMap[char] = (freqMap[char] || 0) + 1;
-    }
-    return freqMap;
+function wordCount(s) {
+  // split on any unicode whitespace sequence; count tokens
+  if (typeof s !== 'string') return 0;
+  const trimmed = s.trim();
+  if (trimmed === '') return 0;
+  const matches = trimmed.match(/\S+/g);
+  return matches ? matches.length : 0;
 }
 
-/**
- * Analyzes a string and computes all required properties.
- * @param {string} value - The input string.
- * @returns {Object} The analysis properties.
- */
-function analyzeString(value) {
-    const hash = sha256Hash(value);
-
-    return {
-        length: value.length,
-        is_palindrome: isPalindrome(value),
-        unique_characters: uniqueCharacters(value),
-        word_count: wordCount(value),
-        sha256_hash: hash,
-        character_frequency_map: charFrequencyMap(value)
-    };
+function nowIso() {
+  return new Date().toISOString();
 }
 
-// --- Natural Language Parsing Logic ---
-
-/**
- * Converts a natural language query into structured filter parameters.
- * Note: This is a simple, rule-based parser and does not use a complex NLP model.
- * @param {string} query - The natural language query string.
- * @returns {Object} Parsed filters or an error object if unresolvable/conflicting.
- */
-function parseNaturalLanguageQuery(query) {
-    const filters = {};
-    const lowerQuery = query.toLowerCase();
-
-    // 1. Palindrome
-    if (lowerQuery.includes('palindrome') || lowerQuery.includes('palindromic')) {
-        filters.is_palindrome = true;
-    }
-
-    // 2. Word Count (exact)
-    // Matches phrases like "single word", "two words", "3 words"
-    const wordCountMatch = lowerQuery.match(/(single|one|two|three|four|five|\d+)\s+word(s)?/);
-    if (wordCountMatch) {
-        const numStr = wordCountMatch[1];
-        let count;
-        if (numStr === 'single' || numStr === 'one') count = 1;
-        else if (numStr === 'two') count = 2;
-        else if (numStr === 'three') count = 3;
-        else if (!isNaN(parseInt(numStr))) count = parseInt(numStr);
-
-        if (count !== undefined) {
-            filters.word_count = count;
-        }
-    }
-
-    // 3. Length (min/max)
-    // Matches "longer than X", "minimum length X", "shorter than Y", "maximum length Y"
-    const lengthRegex = /(longer than|shorter than|min length|max length|at least|at most|greater than|less than)\s*(\d+)/g;
-    let match;
-    while ((match = lengthRegex.exec(lowerQuery)) !== null) {
-        const type = match[1];
-        const num = parseInt(match[2]);
-
-        if (type.includes('longer than') || type.includes('at least') || type.includes('minimum length') || type.includes('greater than')) {
-            filters.min_length = filters.min_length ? Math.max(filters.min_length, num + (type.includes('than') ? 1 : 0)) : num + (type.includes('than') ? 1 : 0);
-        } else if (type.includes('shorter than') || type.includes('at most') || type.includes('maximum length') || type.includes('less than')) {
-            filters.max_length = filters.max_length ? Math.min(filters.max_length, num - (type.includes('than') ? 1 : 0)): num - (type.includes('than') ? 1 : 0);
-        }
-    }
-
-    // 4. Contains Character
-    // Matches "contain(s) the letter z"
-    const containsCharMatch = lowerQuery.match(/contain(s)? the letter\s*["']?([a-z])["']?/i);
-    if (!containsCharMatch) {
-        // Alternative simple match: "contains 'a'" or "with character z"
-        const simpleCharMatch = lowerQuery.match(/(contains|with character|has)\s*["']?([a-z])["']?/i);
-        if (simpleCharMatch) {
-             filters.contains_character = simpleCharMatch[2];
-        } else if (lowerQuery.includes("first vowel")) {
-            filters.contains_character = "a";
-        }
-    } else {
-        filters.contains_character = containsCharMatch[2];
-    }
-
-
-    // 5. Conflict Check
-    if (filters.min_length !== undefined && filters.max_length !== undefined && filters.min_length > filters.max_length) {
-        return { error: 'Query resulted in conflicting minimum and maximum length filters.', code: 422 };
-    }
-
-    // Check if any filter was successfully parsed
-    if (Object.keys(filters).length === 0) {
-        return { error: 'Unable to parse natural language query into structured filters.', code: 400 };
-    }
-
-    return filters;
+function computeProperties(value) {
+  const length = value.length;
+  const pal = isPalindrome(value);
+  const uniq = new Set(Array.from(value)).size; // case-sensitive unique characters (per spec)
+  const wc = wordCount(value);
+  const h = sha256Of(value);
+  const freq = computeCharacterFrequency(value);
+  return {
+    length,
+    is_palindrome: !!pal,
+    unique_characters: uniq,
+    word_count: wc,
+    sha256_hash: h,
+    character_frequency_map: freq,
+  };
 }
 
+function rowToItem(row) {
+  return {
+    id: row.id,
+    value: row.value,
+    properties: JSON.parse(row.properties_json),
+    created_at: row.created_at,
+  };
+}
 
-// --- API Endpoints ---
+// -----------------------------
+// Routes
+// -----------------------------
 
-// 1. Create/Analyze String
+// POST /strings - create/analyze
 app.post('/strings', (req, res) => {
-    const value = req.body.value;
+  const body = req.body;
+  if (!body || !Object.prototype.hasOwnProperty.call(body, 'value')) {
+    return res.status(400).json({ detail: 'Invalid request body or missing "value" field' });
+  }
+  if (typeof body.value !== 'string') {
+    return res.status(422).json({ detail: 'Invalid data type for "value" (must be string)' });
+  }
+  const value = body.value;
+  if (value.length > MAX_STRING_LENGTH) {
+    return res.status(413).json({ detail: 'String too large' });
+  }
 
-    // 400 Bad Request: Missing "value" field
-    if (value === undefined) {
-        return res.status(400).json({ error: 'Bad Request: Missing "value" field in request body.' });
+  const properties = computeProperties(value);
+  const id = properties.sha256_hash;
+  const created_at = nowIso();
+
+  const insert = db.prepare(`
+    INSERT INTO strings (id, value, value_lower, length, word_count, is_palindrome, created_at, properties_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  try {
+    insert.run(
+      id,
+      value,
+      value.toLowerCase(),
+      properties.length,
+      properties.word_count,
+      properties.is_palindrome ? 1 : 0,
+      created_at,
+      JSON.stringify(properties)
+    );
+  } catch (err) {
+    // Determine if it's a UNIQUE constraint violation vs other DB error
+    // better-sqlite3 throws a generic Error; inspect message for 'UNIQUE' as a heuristic
+    const msg = String(err && err.message).toLowerCase();
+    if (msg.includes('unique') || msg.includes('constraint')) {
+      return res.status(409).json({ detail: 'String already exists in the system' });
     }
+    console.error('DB insert error', err);
+    return res.status(500).json({ detail: 'Internal Server Error' });
+  }
 
-    // 422 Unprocessable Entity: Invalid data type for "value"
-    if (typeof value !== 'string') {
-        return res.status(422).json({ error: 'Unprocessable Entity: "value" must be a string.' });
-    }
-
-    const analysis = analyzeString(value);
-    const id = analysis.sha256_hash;
-
-    // 409 Conflict: String already exists
-    if (db.has(id)) {
-        return res.status(409).json({ error: Conflict: String (ID: ${id}) already exists. });
-    }
-
-    const stringData = {
-        id,
-        value,
-        properties: analysis,
-        created_at: new Date().toISOString()
-    };
-
-    db.set(id, stringData);
-
-    // 201 Created
-    res.status(201).json(stringData);
+  return res.status(201).json({ id, value, properties, created_at });
 });
 
-// 2. Get Specific String (by SHA-256 Hash ID)
-app.get('/strings/:id', (req, res) => {
-    const id = req.params.id;
-    const stringData = db.get(id);
-
-    // 404 Not Found
-    if (!stringData) {
-        return res.status(404).json({ error: Not Found: String with ID "${id}" does not exist. });
-    }
-
-    // 200 OK
-    res.status(200).json(stringData);
+// GET /strings/:string_value
+app.get('/strings/:string_value', (req, res) => {
+  const v = req.params.string_value;
+  const row = db.prepare('SELECT * FROM strings WHERE value = ?').get(v);
+  if (!row) return res.status(404).json({ detail: 'String does not exist in the system' });
+  return res.status(200).json(rowToItem(row));
 });
 
-/**
- * Filter function to apply query parameters to string data.
- * @param {Object} item - The string data object from the database.
- * @param {Object} filters - The parsed query filters.
- * @returns {boolean} True if the item matches all filters.
- */
-function applyFilters(item, filters) {
-    const props = item.properties;
+// GET /strings/by-id/:id
+app.get('/strings/by-id/:id', (req, res) => {
+  const id = req.params.id;
+  const row = db.prepare('SELECT * FROM strings WHERE id = ?').get(id);
+  if (!row) return res.status(404).json({ detail: 'String does not exist in the system' });
+  return res.status(200).json(rowToItem(row));
+});
 
-    if (filters.is_palindrome !== undefined && props.is_palindrome !== filters.is_palindrome) {
-        return false;
-    }
-    if (filters.min_length !== undefined && props.length < filters.min_length) {
-        return false;
-    }
-    if (filters.max_length !== undefined && props.length > filters.max_length) {
-        return false;
-    }
-    if (filters.word_count !== undefined && props.word_count !== filters.word_count) {
-        return false;
-    }
-    if (filters.contains_character !== undefined) {
-        // Case-insensitive check for contains_character
-        if (!item.value.toLowerCase().includes(filters.contains_character.toLowerCase())) {
-            return false;
-        }
-    }
-    return true;
+// DELETE /strings/:string_value
+app.delete('/strings/:string_value', (req, res) => {
+  const v = req.params.string_value;
+  const info = db.prepare('DELETE FROM strings WHERE value = ?').run(v);
+  if (info.changes === 0) return res.status(404).json({ detail: 'String does not exist in the system' });
+  return res.status(204).send();
+});
+
+// GET /strings (list + filters)
+app.get('/strings', (req, res) => {
+  const q = req.query || {};
+  const clauses = [];
+  const params = [];
+  const filtersApplied = {};
+
+  // is_palindrome
+  if (q.is_palindrome !== undefined) {
+    if (q.is_palindrome === 'true') clauses.push('is_palindrome = 1');
+    else if (q.is_palindrome === 'false') clauses.push('is_palindrome = 0');
+    else return res.status(400).json({ detail: 'Invalid value for is_palindrome (must be true or false)' });
+    filtersApplied.is_palindrome = q.is_palindrome === 'true';
+  }
+
+  // min_length
+  if (q.min_length !== undefined) {
+    const v = Number(q.min_length);
+    if (!Number.isInteger(v) || v < 0) return res.status(400).json({ detail: 'Invalid min_length' });
+    clauses.push('length >= ?'); params.push(v);
+    filtersApplied.min_length = v;
+  }
+
+  // max_length
+  if (q.max_length !== undefined) {
+    const v = Number(q.max_length);
+    if (!Number.isInteger(v) || v < 0) return res.status(400).json({ detail: 'Invalid max_length' });
+    clauses.push('length <= ?'); params.push(v);
+    filtersApplied.max_length = v;
+  }
+
+  // if min > max -> 422
+  if (filtersApplied.min_length !== undefined && filtersApplied.max_length !== undefined) {
+    if (filtersApplied.min_length > filtersApplied.max_length) return res.status(422).json({ detail: 'min_length cannot be greater than max_length' });
+  }
+
+  // word_count
+  if (q.word_count !== undefined) {
+    const v = Number(q.word_count);
+    if (!Number.isInteger(v) || v < 0) return res.status(400).json({ detail: 'Invalid word_count' });
+    clauses.push('word_count = ?'); params.push(v);
+    filtersApplied.word_count = v;
+  }
+
+  // contains_character (single char) - case-insensitive
+  if (q.contains_character !== undefined) {
+    const ch = q.contains_character;
+    if (typeof ch !== 'string' || ch.length !== 1) return res.status(400).json({ detail: 'contains_character must be a single character' });
+    clauses.push('instr(value_lower, ?) > 0'); params.push(ch.toLowerCase());
+    filtersApplied.contains_character = ch;
+  }
+
+  const where = clauses.length ? ('WHERE ' + clauses.join(' AND ')) : '';
+  const sql = `SELECT * FROM strings ${where} ORDER BY created_at DESC LIMIT 100`;
+
+  try {
+    const rows = db.prepare(sql).all(...params);
+    const items = rows.map(rowToItem);
+    return res.status(200).json({ data: items, count: items.length, filters_applied: Object.keys(filtersApplied).length ? filtersApplied : undefined });
+  } catch (err) {
+    console.error('DB query error', err);
+    return res.status(500).json({ detail: 'Internal Server Error' });
+  }
+});
+
+// Natural language parsing - basic keyword detection per examples
+function parseNlQuery(q) {
+  const original = q;
+  const lower = q.toLowerCase();
+  const parsed = {};
+
+  // single word / one word
+  if (/\b(single|one) word\b/.test(lower)) parsed.word_count = 1;
+
+  // palindromic keywords
+  if (lower.includes('palindr') || lower.includes('palindrom') || lower.includes('palind')) parsed.is_palindrome = true;
+
+  // longer than N
+  let m = lower.match(/longer than (\d+) (characters|chars)?/);
+  if (m) parsed.min_length = Number(m[1]) + 1; // heuristic: "longer than 10" -> min_length 11
+  else {
+    let m2 = lower.match(/longer than (\d+)\b/);
+    if (m2) parsed.min_length = Number(m2[1]) + 1;
+  }
+
+  // containing letter x / contain x
+  let m3 = lower.match(/(?:contain(?:ing)?(?: the)?(?: letter)? )([a-z])\b/);
+  if (m3) parsed.contains_character = m3[1];
+
+  // first vowel -> 'a' heuristic
+  if (lower.includes('first vowel')) parsed.contains_character = 'a';
+
+  if (Object.keys(parsed).length === 0) {
+    throw new Error('Unable to parse natural language query');
+  }
+
+  return { original, parsed_filters: parsed };
 }
 
-// 3. Get All Strings with Filtering
-app.get('/strings', (req, res) => {
-    const query = req.query;
-    const filters = {};
-    const filtersApplied = {};
-
-    // 1. Parse and validate query parameters
-    try {
-        if (query.is_palindrome !== undefined) {
-            if (query.is_palindrome === 'true' || query.is_palindrome === 'false') {
-                filters.is_palindrome = query.is_palindrome === 'true';
-                filtersApplied.is_palindrome = filters.is_palindrome;
-            } else {
-                throw new Error('is_palindrome must be "true" or "false".');
-            }
-        }
-        if (query.min_length !== undefined) {
-            const min = parseInt(query.min_length);
-            if (isNaN(min) || min < 0) throw new Error('min_length must be a non-negative integer.');
-            filters.min_length = min;
-            filtersApplied.min_length = min;
-        }
-        if (query.max_length !== undefined) {
-            const max = parseInt(query.max_length);
-            if (isNaN(max) || max < 0) throw new Error('max_length must be a non-negative integer.');
-            filters.max_length = max;
-            filtersApplied.max_length = max;
-        }
-        if (query.word_count !== undefined) {
-            const count = parseInt(query.word_count);
-            if (isNaN(count) || count < 0) throw new Error('word_count must be a non-negative integer.');
-            filters.word_count = count;
-            filtersApplied.word_count = count;
-        }
-        if (query.contains_character !== undefined) {
-            if (typeof query.contains_character !== 'string' || query.contains_character.length !== 1) {
-                // The prompt says "single character to search for" but allowing longer strings for flexible filtering.
-                // Sticking to strict interpretation for now:
-                // throw new Error('contains_character must be a single character.');
-            }
-            filters.contains_character = query.contains_character;
-            filtersApplied.contains_character = query.contains_character;
-        }
-    } catch (e) {
-        // 400 Bad Request
-        return res.status(400).json({ error: Bad Request: ${e.message} });
-    }
-
-    // 2. Apply filters to the data
-    const results = Array.from(db.values()).filter(item => applyFilters(item, filters));
-
-    // 200 OK
-    res.status(200).json({
-        data: results,
-        count: results.length,
-        filters_applied: filtersApplied
-    });
-});
-
-// 4. Natural Language Filtering
+// GET /strings/filter-by-natural-language
 app.get('/strings/filter-by-natural-language', (req, res) => {
-    const nlQuery = req.query.query;
+  const query = req.query.query;
+  if (!query) return res.status(400).json({ detail: 'query parameter is required' });
 
-    if (!nlQuery) {
-        return res.status(400).json({ error: 'Bad Request: Missing "query" natural language parameter.' });
-    }
+  let interp;
+  try {
+    interp = parseNlQuery(query);
+  } catch (err) {
+    return res.status(400).json({ detail: 'Unable to parse natural language query' });
+  }
 
-    // 1. Parse Natural Language Query
-    const parsedFilters = parseNaturalLanguageQuery(nlQuery);
+  const parsed = interp.parsed_filters;
+  // check for obvious conflicts
+  if ('min_length' in parsed && 'max_length' in parsed) {
+    if (parsed.min_length > parsed.max_length) return res.status(422).json({ detail: 'Query parsed but resulted in conflicting filters' });
+  }
 
-    if (parsedFilters.error) {
-        return res.status(parsedFilters.code).json({
-            error: parsedFilters.error,
-            interpreted_query: {
-                original: nlQuery,
-                parsed_filters: {}
-            }
-        });
-    }
+  // build SQL where clause from parsed
+  const clauses = [];
+  const params = [];
+  if (parsed.is_palindrome) clauses.push('is_palindrome = 1');
+  if ('min_length' in parsed) { clauses.push('length >= ?'); params.push(parsed.min_length); }
+  if ('max_length' in parsed) { clauses.push('length <= ?'); params.push(parsed.max_length); }
+  if ('word_count' in parsed) { clauses.push('word_count = ?'); params.push(parsed.word_count); }
+  if ('contains_character' in parsed) { clauses.push('instr(value_lower, ?) > 0'); params.push(parsed.contains_character.toLowerCase()); }
 
-    // 2. Apply Parsed Filters
-    const results = Array.from(db.values()).filter(item => applyFilters(item, parsedFilters));
+  const where = clauses.length ? ('WHERE ' + clauses.join(' AND ')) : '';
+  const sql = `SELECT * FROM strings ${where} ORDER BY created_at DESC LIMIT 100`;
 
-    // 200 OK
-    res.status(200).json({
-        data: results,
-        count: results.length,
-        interpreted_query: {
-            original: nlQuery,
-            parsed_filters: parsedFilters
-        }
-    });
+  try {
+    const rows = db.prepare(sql).all(...params);
+    const items = rows.map(rowToItem);
+    return res.status(200).json({ data: items, count: items.length, interpreted_query: interp });
+  } catch (err) {
+    console.error('DB query error', err);
+    return res.status(500).json({ detail: 'Internal Server Error' });
+  }
 });
 
-
-// 5. Delete String (by SHA-256 Hash ID)
-app.delete('/strings/:id', (req, res) => {
-    const id = req.params.id;
-
-    // 404 Not Found
-    if (!db.has(id)) {
-        return res.status(404).json({ error: Not Found: String with ID "${id}" does not exist. });
-    }
-
-    db.delete(id);
-
-    // 204 No Content
-    res.status(204).send();
+// -----------------------------
+// Error handling
+// -----------------------------
+app.use((err, req, res, next) => {
+  console.error(err);
+  if (!res.headersSent) res.status(500).json({ detail: 'Internal Server Error' });
 });
 
-// --- Server Start ---
-app.listen(PORT, () => {
-    console.log(String Analyzer Service running on http://localhost:${PORT});
-    console.log(In-memory database initialized. ${db.size} records found.);
-    console.log('Endpoints: POST /strings, GET /strings/:id, GET /strings, GET /strings/filter-by-natural-language, DELETE /strings/:id');
-});
+// -----------------------------
+// Start server only when run directly
+// -----------------------------
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`String Analyzer API listening on http://localhost:${PORT}`));
+}
 
-// Export the app for testing purposes (optional but good practice)
-module.exports = app;
+module.exports = app;
